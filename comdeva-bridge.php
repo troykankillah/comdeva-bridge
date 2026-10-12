@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Comdeva Bridge
  * Description: Låter Comdevas verktyg läsa och ändra Yoast-fält och Elementor-/Divi-innehåll via REST, med samma behörighet som i WordPress (edit_post). Installeras som vanligt tillägg (zip) och uppdateras sedan under Tillägg som andra tillägg.
- * Version: 1.11.1
+ * Version: 1.11.2
  * Author: Comdeva
  * Requires PHP: 7.4
  * Update URI: https://github.com/troykankillah/comdeva-bridge
@@ -28,7 +28,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const COMDEVA_BRIDGE_VERSION = '1.11.1';
+const COMDEVA_BRIDGE_VERSION = '1.11.2';
 
 // Uppdateringar som ett vanligt tillägg: WordPress läser update.json i det publika repot
 // troykankillah/comdeva-bridge (byggs av bridge_release.py) och visar
@@ -50,8 +50,9 @@ function comdeva_bridge_manifest( $force = false ) {
 		? null : json_decode( wp_remote_retrieve_body( $res ), true );
 	$ok   = is_array( $data ) && ! empty( $data['version'] ) && ! empty( $data['signature'] )
 		&& ! empty( $data['download_url'] ) && 0 === strpos( $data['download_url'], COMDEVA_BRIDGE_REPO_RAW );
-	// Misslyckat anrop cachas kortare, så att en tillfällig störning inte döljer en uppdatering länge.
-	set_site_transient( 'comdeva_bridge_manifest', $ok ? $data : array(), $ok ? 6 * HOUR_IN_SECONDS : HOUR_IN_SECONDS );
+	// Kort cache: WordPress begränsar redan hur ofta den söker (12 h, 1 h på Tillägg, 1 min på Uppdateringar),
+	// så en ny version syns vid nästa sökning, inte först när en lång cache gått ut.
+	set_site_transient( 'comdeva_bridge_manifest', $ok ? $data : array(), 5 * MINUTE_IN_SECONDS );
 	return $ok ? $data : null;
 }
 
@@ -77,7 +78,7 @@ add_filter( 'pre_set_site_transient_update_plugins', function ( $transient ) {
 	if ( ! is_object( $transient ) || 0 !== strpos( wp_normalize_path( __FILE__ ), wp_normalize_path( WP_PLUGIN_DIR ) ) ) {
 		return $transient;
 	}
-	// "Sök efter uppdateringar igen" i Kontrollpanelen → Uppdateringar hämtar direkt.
+	// "Sök efter uppdateringar igen" i Kontrollpanelen → Uppdateringar hämtar direkt, förbi cachen.
 	$m = comdeva_bridge_manifest( isset( $_GET['force-check'] ) );
 	if ( ! $m ) {
 		return $transient;
