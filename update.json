@@ -1,0 +1,10 @@
+{
+  "name": "Comdeva Bridge",
+  "version": "1.11.0",
+  "download_url": "https://raw.githubusercontent.com/troykankillah/comdeva-bridge/v1.11.0/comdeva-bridge.zip",
+  "signature": "ltOIiMk9WbJOjzQEsGcdMME9QB8Xi8ly3QIe/UIgFaVyV2Fivca1DgtmZu+rNtX/ITB+G1cGz3jA3LtNPp4aDA==",
+  "homepage": "https://github.com/troykankillah/comdeva-bridge",
+  "requires_php": "7.4",
+  "released": "2026-10-12",
+  "changelog": "<h4>1.11.0 (2026-10-12)</h4><p>Uppdateras som ett vanligt tillägg under Tillägg, med signerade uppdateringar. Läser FluentSMTP:s maillogg.</p>"
+}
