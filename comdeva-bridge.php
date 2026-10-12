@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Comdeva Bridge
  * Description: Låter Comdevas verktyg läsa och ändra Yoast-fält och Elementor-/Divi-innehåll via REST, med samma behörighet som i WordPress (edit_post). Installeras som vanligt tillägg (zip) och uppdateras sedan under Tillägg som andra tillägg.
- * Version: 1.11.2
+ * Version: 1.12.0
  * Author: Comdeva
  * Requires PHP: 7.4
  * Update URI: https://github.com/troykankillah/comdeva-bridge
@@ -21,6 +21,8 @@
  *   GET  /wp-json/comdeva/v1/muffin/<id>     Muffin Builder/BeBuilder (Betheme)
  *   POST /wp-json/comdeva/v1/muffin/<id>     {items, object, local_style, seo, css} – alla delar på en gång
  *   GET/POST /wp-json/comdeva/v1/page-options/<id>  Betheme sidinställningar (mfn-post-*, t.ex. egen meny)
+ *   GET  /wp-json/comdeva/v1/updates[?refresh=1]   tillägg med ny version
+ *   POST /wp-json/comdeva/v1/updates   {plugin, version} – uppdaterar ett tillägg (kräver update_plugins)
  *   GET  /wp-json/comdeva/v1/mail-log        FluentSMTP:s e-postlogg, bara läsning (search, after, before, limit, page)
  */
 
@@ -28,7 +30,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const COMDEVA_BRIDGE_VERSION = '1.11.2';
+const COMDEVA_BRIDGE_VERSION = '1.12.0';
 
 // Uppdateringar som ett vanligt tillägg: WordPress läser update.json i det publika repot
 // troykankillah/comdeva-bridge (byggs av bridge_release.py) och visar
@@ -899,5 +901,137 @@ add_action( 'rest_api_init', function () {
 			}
 			return array( 'total' => $total, 'page' => $page, 'limit' => $limit, 'logs' => $rows );
 		},
+	) );
+} );
+
+// ---------------------------------------------------------------- Tilläggsuppdateringar
+// GET  /comdeva/v1/updates[?refresh=1]       tillägg med ny version (samma lista som Kontrollpanelen → Uppdateringar)
+// POST /comdeva/v1/updates {plugin, version}  uppdaterar ett tillägg till exakt den versionen, som knappen i admin
+// Kräver update_plugins (administratör, och inte DISALLOW_FILE_MODS). Nyckeln är REST-formatet "mapp/fil".
+// Betaltillägg vars uppdaterare bara körs i adminpanelen kan saknas här – de uppdateras i admin.
+
+function comdeva_updates_load() {
+	require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+	require_once ABSPATH . 'wp-admin/includes/misc.php';
+	require_once ABSPATH . 'wp-admin/includes/update.php';
+	require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+}
+
+function comdeva_updates_refresh() {
+	// Som "Sök efter uppdateringar igen": tvinga en ny koll mot wordpress.org och andra uppdaterare.
+	$current = get_site_transient( 'update_plugins' );
+	if ( is_object( $current ) ) {
+		$current->last_checked = 0;
+		set_site_transient( 'update_plugins', $current );
+	}
+	wp_update_plugins();
+}
+
+function comdeva_updates_list() {
+	$current = get_site_transient( 'update_plugins' );
+	$out     = array();
+	foreach ( get_plugins() as $file => $data ) {
+		if ( ! is_object( $current ) || empty( $current->response[ $file ] ) ) {
+			continue;
+		}
+		$u     = (object) $current->response[ $file ];
+		$out[] = array(
+			'plugin'       => preg_replace( '/\.php$/', '', $file ),
+			'name'         => $data['Name'],
+			'version'      => $data['Version'],
+			'new_version'  => isset( $u->new_version ) ? (string) $u->new_version : '',
+			'active'       => is_plugin_active( $file ),
+			'requires'     => isset( $u->requires ) ? (string) $u->requires : '',
+			'requires_php' => isset( $u->requires_php ) ? (string) $u->requires_php : '',
+			'tested'       => isset( $u->tested ) ? (string) $u->tested : '',
+			'package'      => ! empty( $u->package ),
+		);
+	}
+	return $out;
+}
+
+add_action( 'rest_api_init', function () {
+	$can = function () {
+		return current_user_can( 'update_plugins' );
+	};
+	register_rest_route( 'comdeva/v1', '/updates', array(
+		array(
+			'methods'             => 'GET',
+			'permission_callback' => $can,
+			'callback'            => function ( WP_REST_Request $req ) {
+				comdeva_updates_load();
+				if ( $req['refresh'] ) {
+					comdeva_updates_refresh();
+				}
+				return array(
+					'wordpress' => get_bloginfo( 'version' ),
+					'php'       => PHP_VERSION,
+					'plugins'   => comdeva_updates_list(),
+				);
+			},
+		),
+		array(
+			'methods'             => 'POST',
+			'permission_callback' => $can,
+			'callback'            => function ( WP_REST_Request $req ) {
+				comdeva_updates_load();
+				$key  = (string) $req['plugin'];
+				$want = (string) $req['version'];
+				$file = $key . '.php';
+				$all  = get_plugins();
+				if ( '' === $want || ! isset( $all[ $file ] ) ) {
+					return new WP_Error( 'comdeva_update_bad', "Okänt tillägg eller version saknas: $key", array( 'status' => 400 ) );
+				}
+				comdeva_updates_refresh();
+				$offer = null;
+				foreach ( comdeva_updates_list() as $u ) {
+					if ( $u['plugin'] === $key ) {
+						$offer = $u;
+					}
+				}
+				if ( ! $offer || $offer['new_version'] !== $want ) {
+					$got = $offer ? $offer['new_version'] : 'ingen uppdatering';
+					return new WP_Error( 'comdeva_update_mismatch', "$key: WordPress erbjuder $got, planen säger $want", array( 'status' => 409 ) );
+				}
+				if ( ! $offer['package'] ) {
+					return new WP_Error( 'comdeva_update_nopackage', "$key: uppdateringen saknar nedladdning (licens?) – uppdatera i adminpanelen", array( 'status' => 409 ) );
+				}
+				$was_active = is_plugin_active( $file );
+				$before     = $all[ $file ]['Version'];
+				// Samma väg som uppdateringsknappen i admin (wp_ajax_update_plugin): bulk_upgrade med
+				// underhållsläge, tillägget förblir aktivt.
+				$skin     = new WP_Ajax_Upgrader_Skin();
+				$upgrader = new Plugin_Upgrader( $skin );
+				$result   = $upgrader->bulk_upgrade( array( $file ) );
+				$errors   = $skin->get_errors();
+				if ( is_wp_error( $errors ) && $errors->has_errors() ) {
+					return new WP_Error( 'comdeva_update_failed', "$key: " . implode( ' ', $errors->get_error_messages() ), array( 'status' => 500 ) );
+				}
+				if ( ! is_array( $result ) || empty( $result[ $file ] ) || is_wp_error( $result[ $file ] ) ) {
+					global $wp_filesystem;
+					$msg = is_array( $result ) && isset( $result[ $file ] ) && is_wp_error( $result[ $file ] )
+						? $result[ $file ]->get_error_message()
+						: ( $wp_filesystem instanceof WP_Filesystem_Base && is_wp_error( $wp_filesystem->errors ) && $wp_filesystem->errors->has_errors()
+							? $wp_filesystem->errors->get_error_message() : 'uppdateringen gick inte att installera (filsystemet?)' );
+					return new WP_Error( 'comdeva_update_failed', "$key: $msg", array( 'status' => 500 ) );
+				}
+				wp_clean_plugins_cache();
+				$after = get_plugins();
+				$now   = isset( $after[ $file ] ) ? $after[ $file ]['Version'] : '';
+				if ( $was_active && ! is_plugin_active( $file ) ) {
+					$act = activate_plugin( $file, '', false, true );
+					if ( is_wp_error( $act ) ) {
+						return new WP_Error( 'comdeva_update_inactive', "$key uppdaterad till $now men kunde inte aktiveras igen: " . $act->get_error_message(), array( 'status' => 500 ) );
+					}
+				}
+				return array(
+					'plugin' => $key,
+					'from'   => $before,
+					'to'     => $now,
+					'active' => is_plugin_active( $file ),
+				);
+			},
+		),
 	) );
 } );
