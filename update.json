@@ -1,10 +1,10 @@
 {
   "name": "Comdeva Bridge",
-  "version": "1.15.0",
-  "download_url": "https://raw.githubusercontent.com/troykankillah/comdeva-bridge/v1.15.0/comdeva-bridge.zip",
-  "signature": "8d2le9f2Qz2HJ4oF2izBtYDSN1VuRowl2qEw4wF7u6X9+Njk6aMvlHPdtnqeQvkaRGGix4SYn8IrMytXZw9DBA==",
+  "version": "1.16.0",
+  "download_url": "https://raw.githubusercontent.com/troykankillah/comdeva-bridge/v1.16.0/comdeva-bridge.zip",
+  "signature": "+6ay5zbqbkj9KXg/3pT3zsJ6qzQCO4u7lRmnYw8a9KT69FNL7DZyIHgox692WyGtwPTyox+dxoSv+BAjmFHrAg==",
   "homepage": "https://github.com/troykankillah/comdeva-bridge",
   "requires_php": "7.4",
   "released": "2026-10-13",
-  "changelog": "<h4>1.15.0 (2026-10-13)</h4><p>Comdeva Bridge 1.15: säkerhetsgenomsökning (bara läsning) – dolda administratörer, tillägg/mu-plugins/drop-ins, PHP i uploads, kärnfiler mot WordPress.org, misstänkta kodmönster, cron utan funktion; wp.py security och getfile</p><h4>1.14.0 (2026-10-13)</h4><p>Comdeva Bridge 1.14: uppdateringslogg och /maintenance (vad som uppdaterats, när, av vem, vad som väntar) – Kundhälsa ser om månadens webbunderhåll är gjort (utfört/påbörjat/ej gjort/inget att göra), kontrollen körs i den dagliga hämtningen</p><h4>1.12.0 (2026-10-12)</h4><p>Tillägg kan uppdateras via Comdevas verktyg (wp.py updates / plugin_update).</p><h4>1.11.2 (2026-10-12)</h4><p>Nya versioner syns vid nästa uppdateringskoll, även under Tillägg (kortare cache).</p><h4>1.11.1 (2026-10-12)</h4><p>Testversion av uppdateringsflödet. Ingen funktionsändring.</p><h4>1.11.0 (2026-10-12)</h4><p>Uppdateras som ett vanligt tillägg under Tillägg, med signerade uppdateringar. Läser FluentSMTP:s maillogg.</p>"
+  "changelog": "<h4>1.16.0 (2026-10-13)</h4><p>Comdeva Bridge 1.16: karantän för avstängda (skadliga) tillägg – filerna flyttas till wp-content/comdeva-quarantine och får .quarantine, inget raderas, går att flytta tillbaka; wp.py quarantine, mu-plugins grupperas i security</p><h4>1.15.0 (2026-10-13)</h4><p>Comdeva Bridge 1.15: säkerhetsgenomsökning (bara läsning) – dolda administratörer, tillägg/mu-plugins/drop-ins, PHP i uploads, kärnfiler mot WordPress.org, misstänkta kodmönster, cron utan funktion; wp.py security och getfile</p><h4>1.14.0 (2026-10-13)</h4><p>Comdeva Bridge 1.14: uppdateringslogg och /maintenance (vad som uppdaterats, när, av vem, vad som väntar) – Kundhälsa ser om månadens webbunderhåll är gjort (utfört/påbörjat/ej gjort/inget att göra), kontrollen körs i den dagliga hämtningen</p><h4>1.12.0 (2026-10-12)</h4><p>Tillägg kan uppdateras via Comdevas verktyg (wp.py updates / plugin_update).</p><h4>1.11.2 (2026-10-12)</h4><p>Nya versioner syns vid nästa uppdateringskoll, även under Tillägg (kortare cache).</p><h4>1.11.1 (2026-10-12)</h4><p>Testversion av uppdateringsflödet. Ingen funktionsändring.</p><h4>1.11.0 (2026-10-12)</h4><p>Uppdateras som ett vanligt tillägg under Tillägg, med signerade uppdateringar. Läser FluentSMTP:s maillogg.</p>"
 }

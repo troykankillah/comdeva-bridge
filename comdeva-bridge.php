@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Comdeva Bridge
  * Description: Låter Comdevas verktyg läsa och ändra Yoast-fält och Elementor-/Divi-innehåll via REST, med samma behörighet som i WordPress (edit_post). Installeras som vanligt tillägg (zip) och uppdateras sedan under Tillägg som andra tillägg.
- * Version: 1.15.0
+ * Version: 1.16.0
  * Author: Comdeva
  * Requires PHP: 7.4
  * Update URI: https://github.com/troykankillah/comdeva-bridge
@@ -30,13 +30,15 @@
  *   POST /wp-json/comdeva/v1/smartslider/slides       {source, title, slide, params, thumbnail, published} – kopia efter källan
  *   GET  /wp-json/comdeva/v1/security/scan[?days=60&scan=0]  säkerhetsgenomsökning, bara läsning (manage_options)
  *   GET  /wp-json/comdeva/v1/security/file?path=<sökväg>      en fil (base64); aldrig wp-config, arkiv, dumpar
+ *   GET/POST /wp-json/comdeva/v1/security/quarantine  {plugin, dry_run} – avstängd tilläggskatalog i karantän (1.16)
+ *   POST /wp-json/comdeva/v1/security/quarantine/restore  {batch} – flytta tillbaka
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const COMDEVA_BRIDGE_VERSION = '1.15.0';
+const COMDEVA_BRIDGE_VERSION = '1.16.0';
 
 // Uppdateringar som ett vanligt tillägg: WordPress läser update.json i det publika repot
 // troykankillah/comdeva-bridge (byggs av bridge_release.py) och visar
@@ -1355,7 +1357,7 @@ function comdeva_security_is_php( $file ) {
 }
 
 // Alla filer under $dir (rekursivt), högst $limit. Hoppar över cachekataloger.
-function comdeva_security_walk( $dir, $limit = 20000 ) {
+function comdeva_security_walk( $dir, $limit = 20000, $skip_cache = true ) {
 	$out = array();
 	if ( ! is_dir( $dir ) ) {
 		return $out;
@@ -1370,7 +1372,7 @@ function comdeva_security_walk( $dir, $limit = 20000 ) {
 				break;
 			}
 			$p = wp_normalize_path( $f->getPathname() );
-			if ( preg_match( '#/(?:cache|node_modules|\.git)/#', $p ) ) {
+			if ( $skip_cache && preg_match( '#/(?:cache|node_modules|\.git)/#', $p ) ) {
 				continue;
 			}
 			$out[] = $p;
@@ -1632,6 +1634,173 @@ add_action( 'rest_api_init', function () {
 				'base64'   => base64_encode( $content ),
 				'hits'     => comdeva_security_hits( $real ),
 			);
+		},
+	) );
+} );
+
+// ---------------------------------------------------------------------------------------------
+// Karantän (1.16) – flyttar en avstängd tilläggskatalog till wp-content/comdeva-quarantine/<katalog>-<tid>/
+// och lägger till .quarantine på varje fil, så att inget i den kan köras eller anropas direkt (t.ex. ett
+// webbskal). Inget raderas: manifest.json.quarantine visar varje fil med sha256, och restore flyttar tillbaka.
+
+function comdeva_quarantine_root() {
+	return wp_normalize_path( WP_CONTENT_DIR ) . '/comdeva-quarantine';
+}
+
+function comdeva_quarantine_guard( $dir ) {
+	if ( ! is_dir( $dir ) ) {
+		wp_mkdir_p( $dir );
+	}
+	if ( ! file_exists( $dir . '/.htaccess' ) ) {
+		file_put_contents( $dir . '/.htaccess', "Require all denied\nDeny from all\n" );
+	}
+	if ( ! file_exists( $dir . '/index.html' ) ) {
+		file_put_contents( $dir . '/index.html', '' );
+	}
+}
+
+function comdeva_quarantine_plugin( $entry, $dry_run ) {
+	global $wpdb;
+	$entry = basename( (string) $entry );
+	$src   = wp_normalize_path( WP_PLUGIN_DIR ) . '/' . $entry;
+	if ( '' === $entry || '.' === $entry[0] || ! is_dir( $src ) ) {
+		return new WP_Error( 'comdeva_quarantine_missing', "Tilläggskatalogen finns inte: $entry", array( 'status' => 404 ) );
+	}
+	$raw    = $wpdb->get_var( "SELECT option_value FROM {$wpdb->options} WHERE option_name = 'active_plugins'" );
+	$active = (array) maybe_unserialize( $raw );
+	foreach ( $active as $plugin ) {
+		if ( 0 === strpos( (string) $plugin, $entry . '/' ) ) {
+			return new WP_Error( 'comdeva_quarantine_active', "Stäng av $plugin först", array( 'status' => 409 ) );
+		}
+	}
+	$batch = $entry . '-' . gmdate( 'Ymd\THis' );
+	$dst   = comdeva_quarantine_root() . '/' . $batch;
+	$files = array();
+	foreach ( comdeva_security_walk( $src, 20000, false ) as $f ) {
+		$rel     = substr( $f, strlen( $src ) + 1 );
+		$files[] = array(
+			'from'   => comdeva_security_rel( $f ),
+			'to'     => comdeva_security_rel( $dst . '/' . $rel . '.quarantine' ),
+			'size'   => (int) filesize( $f ),
+			'sha256' => hash_file( 'sha256', $f ),
+		);
+	}
+	$manifest = array(
+		'batch'   => $batch,
+		'plugin'  => $entry,
+		'created' => gmdate( 'c' ),
+		'by'      => wp_get_current_user()->user_login,
+		'files'   => $files,
+	);
+	if ( $dry_run ) {
+		$manifest['dry_run'] = true;
+		return $manifest;
+	}
+	comdeva_quarantine_guard( comdeva_quarantine_root() );
+	wp_mkdir_p( $dst );
+	foreach ( $files as $i => $file ) {
+		$from = ABSPATH . $file['from'];
+		$to   = ABSPATH . $file['to'];
+		wp_mkdir_p( dirname( $to ) );
+		if ( ! @rename( $from, $to ) ) {
+			$manifest['files']   = array_slice( $files, 0, $i );
+			$manifest['error']   = 'Kunde inte flytta ' . $file['from'];
+			file_put_contents( $dst . '/manifest.json.quarantine', wp_json_encode( $manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+			return new WP_Error( 'comdeva_quarantine_move', $manifest['error'] . ' – det som flyttats står i manifestet',
+				array( 'status' => 500, 'manifest' => $manifest ) );
+		}
+	}
+	// Tomma kataloger kvar i plugins (filerna är flyttade) tas bort nerifrån och upp.
+	$dirs = array();
+	try {
+		$it = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator( $src, FilesystemIterator::SKIP_DOTS ),
+			RecursiveIteratorIterator::CHILD_FIRST
+		);
+		foreach ( $it as $d ) {
+			if ( $d->isDir() ) {
+				$dirs[] = $d->getPathname();
+			}
+		}
+	} catch ( Exception $e ) {
+		$dirs = array();
+	}
+	foreach ( $dirs as $d ) {
+		@rmdir( $d );
+	}
+	@rmdir( $src );
+	$manifest['source_removed'] = ! is_dir( $src );
+	file_put_contents( $dst . '/manifest.json.quarantine', wp_json_encode( $manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+	return $manifest;
+}
+
+function comdeva_quarantine_list() {
+	$out = array();
+	foreach ( (array) glob( comdeva_quarantine_root() . '/*/manifest.json.quarantine' ) as $m ) {
+		$data = json_decode( (string) file_get_contents( $m ), true );
+		if ( is_array( $data ) ) {
+			$out[] = array(
+				'batch'   => $data['batch'],
+				'plugin'  => $data['plugin'],
+				'created' => $data['created'],
+				'by'      => $data['by'],
+				'files'   => count( $data['files'] ),
+			);
+		}
+	}
+	return $out;
+}
+
+function comdeva_quarantine_restore( $batch ) {
+	$batch = basename( (string) $batch );
+	$m     = comdeva_quarantine_root() . '/' . $batch . '/manifest.json.quarantine';
+	$data  = file_exists( $m ) ? json_decode( (string) file_get_contents( $m ), true ) : null;
+	if ( ! is_array( $data ) ) {
+		return new WP_Error( 'comdeva_quarantine_batch', "Ingen karantän heter $batch", array( 'status' => 404 ) );
+	}
+	foreach ( $data['files'] as $file ) {
+		if ( file_exists( ABSPATH . $file['from'] ) ) {
+			return new WP_Error( 'comdeva_quarantine_exists', 'Filen finns redan: ' . $file['from'], array( 'status' => 409 ) );
+		}
+	}
+	foreach ( $data['files'] as $file ) {
+		wp_mkdir_p( dirname( ABSPATH . $file['from'] ) );
+		@rename( ABSPATH . $file['to'], ABSPATH . $file['from'] );
+	}
+	rename( $m, $m . '.restored-' . gmdate( 'Ymd\THis' ) );
+	return array(
+		'batch'    => $batch,
+		'restored' => count( $data['files'] ),
+	);
+}
+
+add_action( 'rest_api_init', function () {
+	$can = function () {
+		return current_user_can( 'manage_options' ) && current_user_can( 'delete_plugins' );
+	};
+
+	register_rest_route( 'comdeva/v1', '/security/quarantine', array(
+		array(
+			'methods'             => 'GET',
+			'permission_callback' => $can,
+			'callback'            => function () {
+				return comdeva_quarantine_list();
+			},
+		),
+		array(
+			'methods'             => 'POST',
+			'permission_callback' => $can,
+			'callback'            => function ( WP_REST_Request $req ) {
+				return comdeva_quarantine_plugin( $req['plugin'], ! empty( $req['dry_run'] ) );
+			},
+		),
+	) );
+
+	register_rest_route( 'comdeva/v1', '/security/quarantine/restore', array(
+		'methods'             => 'POST',
+		'permission_callback' => $can,
+		'callback'            => function ( WP_REST_Request $req ) {
+			return comdeva_quarantine_restore( $req['batch'] );
 		},
 	) );
 } );
