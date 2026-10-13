@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Comdeva Bridge
  * Description: Låter Comdevas verktyg läsa och ändra Yoast-fält och Elementor-/Divi-innehåll via REST, med samma behörighet som i WordPress (edit_post). Installeras som vanligt tillägg (zip) och uppdateras sedan under Tillägg som andra tillägg.
- * Version: 1.14.0
+ * Version: 1.15.0
  * Author: Comdeva
  * Requires PHP: 7.4
  * Update URI: https://github.com/troykankillah/comdeva-bridge
@@ -28,13 +28,15 @@
  *   GET  /wp-json/comdeva/v1/smartslider     Smart Slider 3: sliders och bilder (kräver manage_options)
  *   POST /wp-json/comdeva/v1/smartslider/slides/<id>  {published, first}
  *   POST /wp-json/comdeva/v1/smartslider/slides       {source, title, slide, params, thumbnail, published} – kopia efter källan
+ *   GET  /wp-json/comdeva/v1/security/scan[?days=60&scan=0]  säkerhetsgenomsökning, bara läsning (manage_options)
+ *   GET  /wp-json/comdeva/v1/security/file?path=<sökväg>      en fil (base64); aldrig wp-config, arkiv, dumpar
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const COMDEVA_BRIDGE_VERSION = '1.14.0';
+const COMDEVA_BRIDGE_VERSION = '1.15.0';
 
 // Uppdateringar som ett vanligt tillägg: WordPress läser update.json i det publika repot
 // troykankillah/comdeva-bridge (byggs av bridge_release.py) och visar
@@ -1298,6 +1300,338 @@ add_action( 'rest_api_init', function () {
 			$cleared = comdeva_ss3_clear_cache( $src['slider'] );
 			$row     = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$t['slides']} WHERE id = %d", $id ), ARRAY_A );
 			return array( 'slide' => comdeva_ss3_slide( $row ), 'cache_cleared' => $cleared );
+		},
+	) );
+} );
+
+// ---------------------------------------------------------------------------------------------
+// Säkerhetsgenomsökning (1.15) – bara läsning. Letar efter bakdörrar efter ett intrång: tillägg och
+// mu-plugins som filtreras bort ur admin, PHP i uploads, kärnfiler som skiljer sig från WordPress.org,
+// administratörer direkt ur databasen (förbi filter som döljer användare) och misstänkta kodmönster.
+// Ändrar ingenting. Filinnehåll kan läsas en fil i taget, aldrig wp-config.php eller liknande.
+
+const COMDEVA_SECURITY_PATTERNS = array(
+	'eval_decode'     => '/\beval\s*\(\s*(?:base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|strrev|hex2bin|\$)/i',
+	'assert_input'    => '/\bassert\s*\(\s*\$_(?:POST|GET|REQUEST|COOKIE|SERVER)/i',
+	'input_call'      => '/\$_(?:POST|GET|REQUEST|COOKIE)\s*\[[^\]]{1,40}\]\s*\(/i',
+	'create_function' => '/\bcreate_function\s*\(/i',
+	'long_base64'     => '/[\'"][A-Za-z0-9+\/]{400,}={0,2}[\'"]/',
+	'decode_chain'    => '/(?:gzinflate|gzuncompress|str_rot13)\s*\(\s*base64_decode/i',
+	'hex_escapes'     => '/(?:\\\\x[0-9a-f]{2}){30,}/i',
+	'chr_chain'       => '/(?:chr\s*\(\s*\d+\s*\)\s*\.\s*){10,}/i',
+	'hide_users'      => '/add_(?:action|filter)\s*\(\s*[\'"](?:pre_user_query|views_users|users_list_table_query_args)[\'"]/i',
+	'hide_plugins'    => '/add_(?:action|filter)\s*\(\s*[\'"](?:all_plugins|site_transient_update_plugins)[\'"]/i',
+	'create_admin'    => '/wp_(?:create|insert)_user[\s\S]{0,300}administrator/i',
+	'remote_exec'     => '/(?:file_get_contents|wp_remote_get|curl_exec)[\s\S]{0,200}(?:eval|file_put_contents)\s*\(/i',
+	'shell'           => '/\b(?:shell_exec|passthru|proc_open|popen|system)\s*\(\s*\$/i',
+);
+
+function comdeva_security_rel( $path ) {
+	$root = wp_normalize_path( ABSPATH );
+	$path = wp_normalize_path( $path );
+	return 0 === strpos( $path, $root ) ? substr( $path, strlen( $root ) ) : $path;
+}
+
+function comdeva_security_hits( $file ) {
+	$size = @filesize( $file );
+	if ( ! $size || $size > 2 * 1024 * 1024 ) {
+		return array();
+	}
+	$code = @file_get_contents( $file );
+	if ( false === $code ) {
+		return array();
+	}
+	$hits = array();
+	foreach ( COMDEVA_SECURITY_PATTERNS as $name => $re ) {
+		if ( preg_match( $re, $code ) ) {
+			$hits[] = $name;
+		}
+	}
+	return $hits;
+}
+
+function comdeva_security_is_php( $file ) {
+	return (bool) preg_match( '/\.(?:php\d?|phtml|phar|pht|inc)$/i', $file );
+}
+
+// Alla filer under $dir (rekursivt), högst $limit. Hoppar över cachekataloger.
+function comdeva_security_walk( $dir, $limit = 20000 ) {
+	$out = array();
+	if ( ! is_dir( $dir ) ) {
+		return $out;
+	}
+	try {
+		$it = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator( $dir, FilesystemIterator::SKIP_DOTS ),
+			RecursiveIteratorIterator::LEAVES_ONLY
+		);
+		foreach ( $it as $f ) {
+			if ( count( $out ) >= $limit ) {
+				break;
+			}
+			$p = wp_normalize_path( $f->getPathname() );
+			if ( preg_match( '#/(?:cache|node_modules|\.git)/#', $p ) ) {
+				continue;
+			}
+			$out[] = $p;
+		}
+	} catch ( Exception $e ) {
+		return $out;
+	}
+	return $out;
+}
+
+function comdeva_security_file_info( $file, $scan ) {
+	$info = array(
+		'path'     => comdeva_security_rel( $file ),
+		'size'     => (int) @filesize( $file ),
+		'modified' => gmdate( 'c', (int) @filemtime( $file ) ),
+	);
+	if ( $scan && comdeva_security_is_php( $file ) ) {
+		$info['hits'] = comdeva_security_hits( $file );
+	}
+	return $info;
+}
+
+function comdeva_security_scan( $days, $scan ) {
+	global $wpdb;
+	@set_time_limit( 300 );
+	$since  = time() - $days * DAY_IN_SECONDS;
+	$report = array( 'generated' => gmdate( 'c' ), 'days' => $days );
+
+	// Aktiva tillägg direkt ur databasen – get_option() går genom filter som skadlig kod kan använda.
+	$raw = $wpdb->get_var( "SELECT option_value FROM {$wpdb->options} WHERE option_name = 'active_plugins'" );
+	$report['active_plugins_raw'] = array_values( (array) maybe_unserialize( $raw ) );
+	if ( ! function_exists( 'get_plugins' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+	$listed = get_plugins();
+
+	// Varje katalog/fil i plugins: rubrik, antal filer, senast ändrad, filer med träffar.
+	$plugins = array();
+	foreach ( (array) scandir( WP_PLUGIN_DIR ) as $entry ) {
+		if ( '.' === $entry[0] || 'index.php' === $entry ) {
+			continue;
+		}
+		$path  = WP_PLUGIN_DIR . '/' . $entry;
+		$files = is_dir( $path ) ? comdeva_security_walk( $path, 5000 ) : array( wp_normalize_path( $path ) );
+		$main  = null;
+		foreach ( $listed as $key => $data ) {
+			if ( $key === $entry || 0 === strpos( $key, $entry . '/' ) ) {
+				$main = array(
+					'file'       => $key,
+					'name'       => $data['Name'],
+					'version'    => $data['Version'],
+					'author'     => $data['Author'],
+					'plugin_uri' => $data['PluginURI'],
+				);
+				break;
+			}
+		}
+		$newest = 0;
+		$recent = 0;
+		$hits   = array();
+		foreach ( $files as $f ) {
+			$m      = (int) @filemtime( $f );
+			$newest = max( $newest, $m );
+			if ( $m >= $since ) {
+				$recent++;
+			}
+			if ( $scan && comdeva_security_is_php( $f ) ) {
+				$h = comdeva_security_hits( $f );
+				if ( $h ) {
+					$hits[] = array(
+						'path'     => comdeva_security_rel( $f ),
+						'hits'     => $h,
+						'modified' => gmdate( 'c', $m ),
+					);
+				}
+			}
+		}
+		$plugins[] = array(
+			'entry'        => $entry,
+			'header'       => $main,
+			'active'       => $main && in_array( $main['file'], $report['active_plugins_raw'], true ),
+			'files'        => count( $files ),
+			'recent_files' => $recent,
+			'newest'       => $newest ? gmdate( 'c', $newest ) : null,
+			'hits'         => $hits,
+		);
+	}
+	$report['plugins'] = $plugins;
+
+	// mu-plugins och drop-ins laddas alltid och syns knappt i admin – visa alla.
+	$report['mu_plugins'] = array();
+	foreach ( comdeva_security_walk( WPMU_PLUGIN_DIR, 2000 ) as $f ) {
+		$report['mu_plugins'][] = comdeva_security_file_info( $f, true );
+	}
+	$report['dropins'] = array();
+	foreach ( (array) glob( WP_CONTENT_DIR . '/*.php' ) as $f ) {
+		$report['dropins'][] = comdeva_security_file_info( $f, true );
+	}
+
+	// PHP i uploads ska inte finnas.
+	$uploads               = wp_get_upload_dir();
+	$report['uploads_php'] = array();
+	foreach ( comdeva_security_walk( $uploads['basedir'], 200000 ) as $f ) {
+		if ( comdeva_security_is_php( $f ) || '.htaccess' === basename( $f ) ) {
+			$report['uploads_php'][] = comdeva_security_file_info( $f, true );
+		}
+	}
+
+	// Teman: bara PHP-filer med träffar eller som ändrats nyligen.
+	$report['themes'] = array();
+	foreach ( (array) glob( get_theme_root() . '/*', GLOB_ONLYDIR ) as $dir ) {
+		$items = array();
+		$count = 0;
+		foreach ( comdeva_security_walk( $dir, 5000 ) as $f ) {
+			$count++;
+			if ( ! comdeva_security_is_php( $f ) ) {
+				continue;
+			}
+			$info = comdeva_security_file_info( $f, $scan );
+			if ( ! empty( $info['hits'] ) || strtotime( $info['modified'] ) >= $since ) {
+				$items[] = $info;
+			}
+		}
+		$report['themes'][] = array(
+			'theme'   => basename( $dir ),
+			'files'   => $count,
+			'flagged' => $items,
+		);
+	}
+
+	// Rotkatalogen: PHP-filer och .htaccess (wp-config.php bara metadata).
+	$report['root'] = array();
+	foreach ( (array) scandir( ABSPATH ) as $f ) {
+		$p = ABSPATH . $f;
+		if ( is_file( $p ) && ( comdeva_security_is_php( $f ) || '.htaccess' === $f || '.user.ini' === $f ) ) {
+			$report['root'][] = comdeva_security_file_info( $p, 'wp-config.php' !== $f );
+		}
+	}
+
+	// Kärnfiler mot WordPress.org:s kontrollsummor.
+	if ( ! function_exists( 'get_core_checksums' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/update.php';
+	}
+	$sums = get_core_checksums( get_bloginfo( 'version' ), get_locale() );
+	if ( ! $sums ) {
+		$sums = get_core_checksums( get_bloginfo( 'version' ), 'en_US' );
+	}
+	$core = array(
+		'available' => (bool) $sums,
+		'checked'   => 0,
+		'modified'  => array(),
+		'missing'   => array(),
+		'unknown'   => array(),
+	);
+	if ( $sums ) {
+		foreach ( $sums as $rel => $md5 ) {
+			if ( 0 === strpos( $rel, 'wp-content/' ) ) {
+				continue;
+			}
+			$p = ABSPATH . $rel;
+			if ( ! file_exists( $p ) ) {
+				$core['missing'][] = $rel;
+				continue;
+			}
+			$core['checked']++;
+			if ( md5_file( $p ) !== $md5 ) {
+				$core['modified'][] = comdeva_security_file_info( $p, true );
+			}
+		}
+		foreach ( array( 'wp-admin', 'wp-includes' ) as $d ) {
+			foreach ( comdeva_security_walk( ABSPATH . $d, 10000 ) as $f ) {
+				$rel = comdeva_security_rel( $f );
+				if ( ! isset( $sums[ $rel ] ) && comdeva_security_is_php( $f ) ) {
+					$core['unknown'][] = comdeva_security_file_info( $f, true );
+				}
+			}
+		}
+	}
+	$report['core'] = $core;
+
+	// Administratörer direkt ur databasen, jämfört med vad WordPress visar.
+	$key    = $wpdb->get_blog_prefix() . 'capabilities';
+	$rows   = $wpdb->get_results( $wpdb->prepare(
+		"SELECT u.ID, u.user_login, u.user_email, u.user_registered, m.meta_value FROM {$wpdb->users} u
+		 JOIN {$wpdb->usermeta} m ON m.user_id = u.ID AND m.meta_key = %s",
+		$key
+	), ARRAY_A );
+	$admins = array();
+	foreach ( (array) $rows as $r ) {
+		$caps = maybe_unserialize( $r['meta_value'] );
+		if ( is_array( $caps ) && ! empty( $caps['administrator'] ) ) {
+			$admins[] = array(
+				'id'         => (int) $r['ID'],
+				'login'      => $r['user_login'],
+				'email'      => $r['user_email'],
+				'registered' => $r['user_registered'],
+			);
+		}
+	}
+	$visible                 = array_map( 'intval', get_users( array( 'role' => 'administrator', 'fields' => 'ID' ) ) );
+	$report['admins']        = $admins;
+	$report['admins_hidden'] = array_values( array_diff( wp_list_pluck( $admins, 'id' ), $visible ) );
+	$report['users_total']   = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->users}" );
+
+	// Schemalagda jobb – ett vanligt sätt att lägga tillbaka bakdörrar.
+	$hooks = array();
+	foreach ( (array) _get_cron_array() as $ts => $events ) {
+		foreach ( (array) $events as $hook => $unused ) {
+			$hooks[ $hook ] = array(
+				'hook'         => $hook,
+				'next'         => gmdate( 'c', (int) $ts ),
+				'has_callback' => (bool) has_action( $hook ),
+			);
+		}
+	}
+	$report['cron'] = array_values( $hooks );
+	return $report;
+}
+
+add_action( 'rest_api_init', function () {
+	$is_admin = function () {
+		return current_user_can( 'manage_options' );
+	};
+
+	register_rest_route( 'comdeva/v1', '/security/scan', array(
+		'methods'             => 'GET',
+		'permission_callback' => $is_admin,
+		'callback'            => function ( WP_REST_Request $req ) {
+			$days = max( 1, min( 365, (int) ( $req['days'] ? $req['days'] : 60 ) ) );
+			return comdeva_security_scan( $days, '0' !== (string) $req['scan'] );
+		},
+	) );
+
+	// En fil i taget, relativt WordPress-roten. Aldrig wp-config, databasdumpar, arkiv eller loggar.
+	register_rest_route( 'comdeva/v1', '/security/file', array(
+		'methods'             => 'GET',
+		'permission_callback' => $is_admin,
+		'callback'            => function ( WP_REST_Request $req ) {
+			$rel  = ltrim( wp_normalize_path( (string) $req['path'] ), '/' );
+			$root = trailingslashit( wp_normalize_path( realpath( ABSPATH ) ) );
+			$real = realpath( ABSPATH . $rel );
+			$real = $real ? wp_normalize_path( $real ) : '';
+			if ( ! $real || 0 !== strpos( $real, $root ) || ! is_file( $real ) ) {
+				return new WP_Error( 'comdeva_security_path', 'Filen finns inte inom WordPress-roten', array( 'status' => 404 ) );
+			}
+			if ( preg_match( '/(?:wp-config[^\/]*\.php|\.env|\.sql|\.gz|\.zip|\.tar|\.bak|\.log)$/i', $real ) ) {
+				return new WP_Error( 'comdeva_security_denied', 'Den filen läses inte via Bridge', array( 'status' => 403 ) );
+			}
+			$size = filesize( $real );
+			if ( $size > 1024 * 1024 ) {
+				return new WP_Error( 'comdeva_security_size', 'Filen är större än 1 MB', array( 'status' => 413 ) );
+			}
+			$content = (string) file_get_contents( $real );
+			return array(
+				'path'     => comdeva_security_rel( $real ),
+				'size'     => $size,
+				'modified' => gmdate( 'c', filemtime( $real ) ),
+				'sha256'   => hash( 'sha256', $content ),
+				'base64'   => base64_encode( $content ),
+				'hits'     => comdeva_security_hits( $real ),
+			);
 		},
 	) );
 } );
