@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Comdeva Bridge
  * Description: Låter Comdevas verktyg läsa och ändra Yoast-fält och Elementor-/Divi-innehåll via REST, med samma behörighet som i WordPress (edit_post). Installeras som vanligt tillägg (zip) och uppdateras sedan under Tillägg som andra tillägg.
- * Version: 1.12.0
+ * Version: 1.14.0
  * Author: Comdeva
  * Requires PHP: 7.4
  * Update URI: https://github.com/troykankillah/comdeva-bridge
@@ -23,14 +23,18 @@
  *   GET/POST /wp-json/comdeva/v1/page-options/<id>  Betheme sidinställningar (mfn-post-*, t.ex. egen meny)
  *   GET  /wp-json/comdeva/v1/updates[?refresh=1]   tillägg med ny version
  *   POST /wp-json/comdeva/v1/updates   {plugin, version} – uppdaterar ett tillägg (kräver update_plugins)
+ *   GET  /wp-json/comdeva/v1/maintenance[?refresh=1]  webbunderhåll: uppdateringslogg, senast ändrad per tillägg/tema/kärna, antal som väntar
  *   GET  /wp-json/comdeva/v1/mail-log        FluentSMTP:s e-postlogg, bara läsning (search, after, before, limit, page)
+ *   GET  /wp-json/comdeva/v1/smartslider     Smart Slider 3: sliders och bilder (kräver manage_options)
+ *   POST /wp-json/comdeva/v1/smartslider/slides/<id>  {published, first}
+ *   POST /wp-json/comdeva/v1/smartslider/slides       {source, title, slide, params, thumbnail, published} – kopia efter källan
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const COMDEVA_BRIDGE_VERSION = '1.12.0';
+const COMDEVA_BRIDGE_VERSION = '1.14.0';
 
 // Uppdateringar som ett vanligt tillägg: WordPress läser update.json i det publika repot
 // troykankillah/comdeva-bridge (byggs av bridge_release.py) och visar
@@ -1033,5 +1037,267 @@ add_action( 'rest_api_init', function () {
 				);
 			},
 		),
+	) );
+} );
+
+// ---------------------------------------------------------------- Webbunderhåll (1.14)
+// Loggar varje uppdatering av tillägg, teman, WordPress och översättningar – i admin, via bryggan eller automatiskt –
+// så att Kundhälsa ser om månadens webbunderhåll är gjort. Sparas i en option (senaste 300), inget skickas någonstans.
+// GET /comdeva/v1/maintenance visar loggen plus när varje tillägg, tema och WordPress-kärnan senast ändrades på disk
+// (fungerar även för uppdateringar gjorda innan loggen fanns).
+
+const COMDEVA_UPDATE_LOG = 'comdeva_update_log';
+
+add_action( 'upgrader_process_complete', function ( $upgrader, $extra ) {
+	if ( ! is_array( $extra ) || empty( $extra['type'] ) || ( isset( $extra['action'] ) && 'update' !== $extra['action'] ) ) {
+		return;
+	}
+	$type  = (string) $extra['type'];
+	$items = array();
+	if ( 'plugin' === $type ) {
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		wp_clean_plugins_cache( false );
+		$all   = get_plugins();
+		$files = ! empty( $extra['plugins'] ) ? (array) $extra['plugins'] : ( ! empty( $extra['plugin'] ) ? array( $extra['plugin'] ) : array() );
+		foreach ( $files as $file ) {
+			$items[] = array(
+				'key'     => preg_replace( '/\.php$/', '', (string) $file ),
+				'name'    => isset( $all[ $file ] ) ? $all[ $file ]['Name'] : (string) $file,
+				'version' => isset( $all[ $file ] ) ? $all[ $file ]['Version'] : '',
+			);
+		}
+	} elseif ( 'theme' === $type ) {
+		$slugs = ! empty( $extra['themes'] ) ? (array) $extra['themes'] : ( ! empty( $extra['theme'] ) ? array( $extra['theme'] ) : array() );
+		foreach ( $slugs as $slug ) {
+			$t       = wp_get_theme( $slug );
+			$items[] = array( 'key' => (string) $slug, 'name' => $t->exists() ? $t->get( 'Name' ) : (string) $slug, 'version' => $t->exists() ? $t->get( 'Version' ) : '' );
+		}
+	} elseif ( 'core' === $type ) {
+		$items[] = array( 'key' => 'wordpress', 'name' => 'WordPress', 'version' => get_bloginfo( 'version' ) );
+	} elseif ( 'translation' === $type ) {
+		$items[] = array( 'key' => 'translations', 'name' => 'Översättningar', 'version' => '' );
+	} else {
+		return;
+	}
+	if ( ! $items ) {
+		return;
+	}
+	$user = wp_get_current_user();
+	$log  = get_option( COMDEVA_UPDATE_LOG, array() );
+	if ( ! is_array( $log ) ) {
+		$log = array();
+	}
+	$log[] = array(
+		'time'  => gmdate( 'c' ),
+		'type'  => $type,
+		'items' => $items,
+		'by'    => ( $user && $user->exists() ) ? $user->user_login : 'automatisk',
+		'via'   => ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ? 'rest' : ( wp_doing_cron() ? 'cron' : 'admin' ),
+	);
+	update_option( COMDEVA_UPDATE_LOG, array_slice( $log, -300 ), false );
+}, 10, 2 );
+
+function comdeva_mtime( $paths ) {
+	$latest = 0;
+	foreach ( $paths as $path ) {
+		if ( $path && file_exists( $path ) ) {
+			$latest = max( $latest, (int) @filemtime( $path ) );
+		}
+	}
+	return $latest ? gmdate( 'c', $latest ) : null;
+}
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'comdeva/v1', '/maintenance', array(
+		'methods'             => 'GET',
+		'permission_callback' => function () {
+			return current_user_can( 'update_plugins' );
+		},
+		'callback'            => function ( WP_REST_Request $req ) {
+			comdeva_updates_load();
+			if ( $req['refresh'] ) {
+				comdeva_updates_refresh();
+			}
+			$plugins = array();
+			foreach ( get_plugins() as $file => $data ) {
+				$dir       = dirname( $file );
+				$plugins[] = array(
+					'plugin'   => preg_replace( '/\.php$/', '', $file ),
+					'name'     => $data['Name'],
+					'version'  => $data['Version'],
+					'active'   => is_plugin_active( $file ),
+					'modified' => comdeva_mtime( array( WP_PLUGIN_DIR . '/' . $file, '.' !== $dir ? WP_PLUGIN_DIR . '/' . $dir : null ) ),
+				);
+			}
+			$themes = array();
+			foreach ( wp_get_themes() as $slug => $t ) {
+				$themes[] = array(
+					'theme'    => (string) $slug,
+					'name'     => $t->get( 'Name' ),
+					'version'  => $t->get( 'Version' ),
+					'active'   => get_stylesheet() === $slug || get_template() === $slug,
+					'modified' => comdeva_mtime( array( $t->get_stylesheet_directory() . '/style.css', $t->get_stylesheet_directory() ) ),
+				);
+			}
+			$log = get_option( COMDEVA_UPDATE_LOG, array() );
+			return array(
+				'now'     => gmdate( 'c' ),
+				'bridge'  => COMDEVA_BRIDGE_VERSION,
+				'core'    => array( 'version' => get_bloginfo( 'version' ), 'modified' => comdeva_mtime( array( ABSPATH . WPINC . '/version.php' ) ) ),
+				'plugins' => $plugins,
+				'themes'  => $themes,
+				'pending' => comdeva_updates_list(),
+				'log'     => is_array( $log ) ? array_reverse( $log ) : array(),
+			);
+		},
+	) );
+} );
+
+// Smart Slider 3: bilderna ligger i egna tabeller, utan REST-API. Läsa alla, avpublicera/publicera en bild
+// och kopiera en bild med nytt innehåll (läggs direkt efter källan). Inget raderas. Kräver manage_options.
+function comdeva_ss3_tables() {
+	global $wpdb;
+	$slides  = $wpdb->prefix . 'nextend2_smartslider3_slides';
+	$sliders = $wpdb->prefix . 'nextend2_smartslider3_sliders';
+	if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $slides ) ) !== $slides ) {
+		return null;
+	}
+	return array( 'slides' => $slides, 'sliders' => $sliders );
+}
+
+function comdeva_ss3_slide( $row ) {
+	return array(
+		'id'           => (int) $row['id'],
+		'slider'       => (int) $row['slider'],
+		'title'        => (string) $row['title'],
+		'published'    => (int) $row['published'],
+		'first'        => (int) $row['first'],
+		'ordering'     => (int) $row['ordering'],
+		'publish_up'   => (string) $row['publish_up'],
+		'publish_down' => (string) $row['publish_down'],
+		'thumbnail'    => (string) $row['thumbnail'],
+		'slide'        => (string) $row['slide'],
+		'params'       => (string) $row['params'],
+		'generator_id' => (int) $row['generator_id'],
+	);
+}
+
+// Smart Slider sparar färdig HTML i sin cache – töm den för slidern efter en ändring.
+function comdeva_ss3_clear_cache( $slider ) {
+	if ( class_exists( '\Nextend\SmartSlider3\PublicApi\Project' )
+		&& method_exists( '\Nextend\SmartSlider3\PublicApi\Project', 'clearCache' ) ) {
+		\Nextend\SmartSlider3\PublicApi\Project::clearCache( (int) $slider );
+		return true;
+	}
+	return false;
+}
+
+add_action( 'rest_api_init', function () {
+	$can = function () {
+		return current_user_can( 'manage_options' );
+	};
+	$missing = function () {
+		return new WP_Error( 'comdeva_ss3_missing', 'Smart Slider 3 finns inte på sajten', array( 'status' => 404 ) );
+	};
+	register_rest_route( 'comdeva/v1', '/smartslider', array(
+		'methods'             => 'GET',
+		'permission_callback' => $can,
+		'callback'            => function () use ( $missing ) {
+			global $wpdb;
+			$t = comdeva_ss3_tables();
+			if ( ! $t ) {
+				return $missing();
+			}
+			$sliders = array();
+			foreach ( $wpdb->get_results( "SELECT id, title, type, slider_status FROM {$t['sliders']} ORDER BY id", ARRAY_A ) as $s ) {
+				$sliders[] = array( 'id' => (int) $s['id'], 'title' => (string) $s['title'], 'type' => (string) $s['type'],
+					'status' => (string) $s['slider_status'] );
+			}
+			$slides = array();
+			foreach ( $wpdb->get_results( "SELECT * FROM {$t['slides']} ORDER BY slider, ordering, id", ARRAY_A ) as $r ) {
+				$slides[] = comdeva_ss3_slide( $r );
+			}
+			return array( 'sliders' => $sliders, 'slides' => $slides );
+		},
+	) );
+	register_rest_route( 'comdeva/v1', '/smartslider/slides/(?P<id>\d+)', array(
+		'methods'             => 'POST',
+		'permission_callback' => $can,
+		'callback'            => function ( WP_REST_Request $req ) use ( $missing ) {
+			global $wpdb;
+			$t = comdeva_ss3_tables();
+			if ( ! $t ) {
+				return $missing();
+			}
+			$id  = (int) $req['id'];
+			$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$t['slides']} WHERE id = %d", $id ), ARRAY_A );
+			if ( ! $row ) {
+				return new WP_Error( 'comdeva_ss3_slide', "Bilden finns inte: $id", array( 'status' => 404 ) );
+			}
+			$data = array();
+			foreach ( array( 'published', 'first' ) as $key ) {
+				if ( null !== $req[ $key ] ) {
+					$data[ $key ] = $req[ $key ] ? 1 : 0;
+				}
+			}
+			if ( ! $data ) {
+				return new WP_Error( 'comdeva_ss3_fields', 'Ange published och/eller first', array( 'status' => 400 ) );
+			}
+			if ( false === $wpdb->update( $t['slides'], $data, array( 'id' => $id ) ) ) {
+				return new WP_Error( 'comdeva_ss3_db', $wpdb->last_error, array( 'status' => 500 ) );
+			}
+			$cleared = comdeva_ss3_clear_cache( $row['slider'] );
+			$row     = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$t['slides']} WHERE id = %d", $id ), ARRAY_A );
+			return array( 'slide' => comdeva_ss3_slide( $row ), 'cache_cleared' => $cleared );
+		},
+	) );
+	register_rest_route( 'comdeva/v1', '/smartslider/slides', array(
+		'methods'             => 'POST',
+		'permission_callback' => $can,
+		'callback'            => function ( WP_REST_Request $req ) use ( $missing ) {
+			global $wpdb;
+			$t = comdeva_ss3_tables();
+			if ( ! $t ) {
+				return $missing();
+			}
+			$src = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$t['slides']} WHERE id = %d", (int) $req['source'] ), ARRAY_A );
+			if ( ! $src ) {
+				return new WP_Error( 'comdeva_ss3_slide', 'Källbilden finns inte: ' . (int) $req['source'], array( 'status' => 404 ) );
+			}
+			$title = trim( (string) $req['title'] );
+			if ( '' === $title ) {
+				return new WP_Error( 'comdeva_ss3_fields', 'title krävs', array( 'status' => 400 ) );
+			}
+			$new = $src;
+			unset( $new['id'] );
+			$new['title']     = $title;
+			$new['first']     = 0;
+			$new['published'] = $req['published'] ? 1 : 0;
+			$new['ordering']  = (int) $src['ordering'] + 1;
+			foreach ( array( 'slide', 'params' ) as $key ) {  // JSON som text, sparas tecken för tecken
+				if ( null !== $req[ $key ] ) {
+					$value = (string) $req[ $key ];
+					if ( null === json_decode( $value, true ) ) {
+						return new WP_Error( 'comdeva_ss3_json', "$key är inte giltig JSON", array( 'status' => 400 ) );
+					}
+					$new[ $key ] = $value;
+				}
+			}
+			if ( null !== $req['thumbnail'] ) {
+				$new['thumbnail'] = (string) $req['thumbnail'];
+			}
+			// Plats direkt efter källan: flytta de senare bilderna i samma slider ett steg.
+			$wpdb->query( $wpdb->prepare( "UPDATE {$t['slides']} SET ordering = ordering + 1 WHERE slider = %d AND ordering > %d",
+				(int) $src['slider'], (int) $src['ordering'] ) );
+			if ( false === $wpdb->insert( $t['slides'], $new ) ) {
+				return new WP_Error( 'comdeva_ss3_db', $wpdb->last_error, array( 'status' => 500 ) );
+			}
+			$id      = (int) $wpdb->insert_id;
+			$cleared = comdeva_ss3_clear_cache( $src['slider'] );
+			$row     = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$t['slides']} WHERE id = %d", $id ), ARRAY_A );
+			return array( 'slide' => comdeva_ss3_slide( $row ), 'cache_cleared' => $cleared );
+		},
 	) );
 } );
