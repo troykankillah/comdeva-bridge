@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Comdeva Bridge
  * Description: Låter Comdevas verktyg läsa och ändra Yoast-fält och Elementor-/Divi-innehåll via REST, med samma behörighet som i WordPress (edit_post). Installeras som vanligt tillägg (zip) och uppdateras sedan under Tillägg som andra tillägg.
- * Version: 1.16.0
+ * Version: 1.17.0
  * Author: Comdeva
  * Requires PHP: 7.4
  * Update URI: https://github.com/troykankillah/comdeva-bridge
@@ -32,13 +32,14 @@
  *   GET  /wp-json/comdeva/v1/security/file?path=<sökväg>      en fil (base64); aldrig wp-config, arkiv, dumpar
  *   GET/POST /wp-json/comdeva/v1/security/quarantine  {plugin, dry_run} – avstängd tilläggskatalog i karantän (1.16)
  *   POST /wp-json/comdeva/v1/security/quarantine/restore  {batch} – flytta tillbaka
+ *   POST /wp-json/comdeva/v1/theme-file  {path, sha256, find, replace, dry_run} – byt exakt en textbit i en temafil (1.17)
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const COMDEVA_BRIDGE_VERSION = '1.16.0';
+const COMDEVA_BRIDGE_VERSION = '1.17.0';
 
 // Uppdateringar som ett vanligt tillägg: WordPress läser update.json i det publika repot
 // troykankillah/comdeva-bridge (byggs av bridge_release.py) och visar
@@ -1802,5 +1803,125 @@ add_action( 'rest_api_init', function () {
 		'callback'            => function ( WP_REST_Request $req ) {
 			return comdeva_quarantine_restore( $req['batch'] );
 		},
+	) );
+} );
+
+// ---------------------------------------------------------------------------------------------
+// Temafiler (1.17) – byter exakt en textbit i en fil under wp-content/themes. Stoppar om filen ändrats sedan
+// den lästes (sha256), om texten inte finns exakt en gång eller om PHP-koden inte går att tolka. Originalet
+// sparas i wp-content/comdeva-backups/ och skickas tillbaka i svaret. Efter ändringen töms sidcachen och
+// startsidan hämtas; svarar den inte (eller med 5xx) läggs originalet tillbaka direkt.
+
+function comdeva_clear_page_cache() {
+	$done = array();
+	if ( function_exists( 'wpfc_clear_all_cache' ) ) {
+		wpfc_clear_all_cache( true );
+		$done[] = 'wp-fastest-cache';
+	}
+	if ( function_exists( 'rocket_clean_domain' ) ) {
+		rocket_clean_domain();
+		$done[] = 'wp-rocket';
+	}
+	if ( has_action( 'litespeed_purge_all' ) ) {
+		do_action( 'litespeed_purge_all' );
+		$done[] = 'litespeed';
+	}
+	if ( function_exists( 'w3tc_flush_all' ) ) {
+		w3tc_flush_all();
+		$done[] = 'w3-total-cache';
+	}
+	return $done;
+}
+
+function comdeva_theme_file_path( $rel ) {
+	$root = trailingslashit( wp_normalize_path( realpath( get_theme_root() ) ) );
+	$real = realpath( get_theme_root() . '/' . ltrim( (string) $rel, '/' ) );
+	$real = $real ? wp_normalize_path( $real ) : '';
+	if ( ! $real || 0 !== strpos( $real, $root ) || ! is_file( $real ) || ! preg_match( '/\.(?:php|css|js)$/i', $real ) ) {
+		return new WP_Error( 'comdeva_theme_path', 'Ingen php/css/js-fil i wp-content/themes med den sökvägen', array( 'status' => 404 ) );
+	}
+	return $real;
+}
+
+function comdeva_php_parse_error( $code ) {
+	try {
+		token_get_all( $code, TOKEN_PARSE );
+	} catch ( ParseError $e ) {
+		return $e->getMessage() . ' (rad ' . $e->getLine() . ')';
+	}
+	return null;
+}
+
+function comdeva_theme_file_edit( WP_REST_Request $req ) {
+	$real = comdeva_theme_file_path( $req['path'] );
+	if ( is_wp_error( $real ) ) {
+		return $real;
+	}
+	$old  = (string) file_get_contents( $real );
+	$hash = hash( 'sha256', $old );
+	if ( (string) $req['sha256'] !== $hash ) {
+		return new WP_Error( 'comdeva_theme_changed', 'Filen har ändrats sedan den lästes (sha256 stämmer inte)',
+			array( 'status' => 409, 'sha256' => $hash ) );
+	}
+	$find = (string) $req['find'];
+	if ( '' === $find || 1 !== substr_count( $old, $find ) ) {
+		return new WP_Error( 'comdeva_theme_find', 'Texten finns ' . substr_count( $old, $find ) . ' gånger i filen, inte exakt en',
+			array( 'status' => 409 ) );
+	}
+	$new = str_replace( $find, (string) $req['replace'], $old );
+	if ( preg_match( '/\.php$/i', $real ) ) {
+		$err = comdeva_php_parse_error( $new );
+		if ( $err ) {
+			return new WP_Error( 'comdeva_theme_syntax', 'Den nya koden går inte att tolka: ' . $err, array( 'status' => 400 ) );
+		}
+	}
+	$out = array(
+		'path'       => comdeva_security_rel( $real ),
+		'old_sha256' => $hash,
+		'new_sha256' => hash( 'sha256', $new ),
+		'old_size'   => strlen( $old ),
+		'new_size'   => strlen( $new ),
+	);
+	if ( ! empty( $req['dry_run'] ) ) {
+		$out['dry_run'] = true;
+		return $out;
+	}
+	$dir = wp_normalize_path( WP_CONTENT_DIR ) . '/comdeva-backups';
+	comdeva_quarantine_guard( $dir );
+	$backup = $dir . '/' . str_replace( '/', '__', $out['path'] ) . '.' . gmdate( 'Ymd\THis' ) . '.bak';
+	if ( false === file_put_contents( $backup, $old ) ) {
+		return new WP_Error( 'comdeva_theme_backup', 'Kunde inte spara säkerhetskopian', array( 'status' => 500 ) );
+	}
+	if ( false === file_put_contents( $real, $new, LOCK_EX ) ) {
+		return new WP_Error( 'comdeva_theme_write', 'Kunde inte skriva filen', array( 'status' => 500 ) );
+	}
+	if ( function_exists( 'opcache_invalidate' ) ) {
+		@opcache_invalidate( $real, true );
+	}
+	$res  = wp_remote_get( add_query_arg( 'comdeva-check', time(), home_url( '/' ) ),
+		array( 'timeout' => 30, 'sslverify' => false, 'user-agent' => 'Comdeva-System/1.0 (+https://comdeva.se)' ) );
+	$code = is_wp_error( $res ) ? 0 : (int) wp_remote_retrieve_response_code( $res );
+	if ( ! $code || $code >= 500 ) {
+		file_put_contents( $real, $old, LOCK_EX );
+		if ( function_exists( 'opcache_invalidate' ) ) {
+			@opcache_invalidate( $real, true );
+		}
+		return new WP_Error( 'comdeva_theme_reverted', "Startsidan svarade $code efter ändringen – originalet är tillbakalagt",
+			array( 'status' => 500 ) );
+	}
+	$out['backup']        = comdeva_security_rel( $backup );
+	$out['home_status']   = $code;
+	$out['cache_cleared'] = comdeva_clear_page_cache();
+	$out['old_base64']    = base64_encode( $old );
+	return $out;
+}
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'comdeva/v1', '/theme-file', array(
+		'methods'             => 'POST',
+		'permission_callback' => function () {
+			return current_user_can( 'manage_options' );
+		},
+		'callback'            => 'comdeva_theme_file_edit',
 	) );
 } );
