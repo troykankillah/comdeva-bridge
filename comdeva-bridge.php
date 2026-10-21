@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Comdeva Bridge
- * Description: Låter Comdevas verktyg läsa och ändra Yoast-fält och Elementor-/Divi-innehåll via REST, med samma behörighet som i WordPress (edit_post). Installeras som vanligt tillägg (zip) och uppdateras sedan under Tillägg som andra tillägg.
- * Version: 1.17.0
+ * Description: Låter Comdevas verktyg läsa och ändra SEO-fält (Yoast eller Rank Math) och Elementor-/Divi-innehåll via REST, med samma behörighet som i WordPress (edit_post). Installeras som vanligt tillägg (zip) och uppdateras sedan under Tillägg som andra tillägg.
+ * Version: 1.20.0
  * Author: Comdeva
  * Requires PHP: 7.4
  * Update URI: https://github.com/troykankillah/comdeva-bridge
@@ -10,7 +10,8 @@
  * Endpoints (kräver inloggning, t.ex. Application Password):
  *   GET  /wp-json/comdeva/v1/status
  *   GET  /wp-json/comdeva/v1/seo/<id>
- *   POST /wp-json/comdeva/v1/seo/<id>        {title, description, focus_keyword, canonical, noindex}
+ *   POST /wp-json/comdeva/v1/seo/<id>        {title, description, focus_keyword, canonical, noindex} – Yoast eller Rank Math (1.18)
+ *   GET/POST /wp-json/comdeva/v1/site-verification  {google} – Search Console-koden i Yoast/Rank Math (1.18, manage_options)
  *   GET  /wp-json/comdeva/v1/elementor/<id>
  *   POST /wp-json/comdeva/v1/elementor/<id>  {elements: [...]}
  *   GET  /wp-json/comdeva/v1/divi/<id>       sida eller Divi-layout (header/footer)
@@ -31,15 +32,18 @@
  *   GET  /wp-json/comdeva/v1/security/scan[?days=60&scan=0]  säkerhetsgenomsökning, bara läsning (manage_options)
  *   GET  /wp-json/comdeva/v1/security/file?path=<sökväg>      en fil (base64); aldrig wp-config, arkiv, dumpar
  *   GET/POST /wp-json/comdeva/v1/security/quarantine  {plugin, dry_run} – avstängd tilläggskatalog i karantän (1.16)
+ *                                                     {uploads, dry_run} – katalog under uploads, t.ex. kvarlämnade
+ *                                                     backuper efter ett avinstallerat tillägg (1.20)
  *   POST /wp-json/comdeva/v1/security/quarantine/restore  {batch} – flytta tillbaka
  *   POST /wp-json/comdeva/v1/theme-file  {path, sha256, find, replace, dry_run} – byt exakt en textbit i en temafil (1.17)
+ *   POST /wp-json/comdeva/v1/cache  {dry_run} – Elementors kit-CSS skrivs om, sedan töms sidcachen (WP Rocket m.fl.) (1.19)
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const COMDEVA_BRIDGE_VERSION = '1.17.0';
+const COMDEVA_BRIDGE_VERSION = '1.20.0';
 
 // Uppdateringar som ett vanligt tillägg: WordPress läser update.json i det publika repot
 // troykankillah/comdeva-bridge (byggs av bridge_release.py) och visar
@@ -180,6 +184,41 @@ const COMDEVA_SEO_FIELDS = array(
 	'noindex'       => '_yoast_wpseo_meta-robots-noindex',
 );
 
+// Rank Math (1.18): samma fält, andra metanycklar. noindex ligger i listan rank_math_robots.
+const COMDEVA_RANKMATH_FIELDS = array(
+	'title'         => 'rank_math_title',
+	'description'   => 'rank_math_description',
+	'focus_keyword' => 'rank_math_focus_keyword',
+	'canonical'     => 'rank_math_canonical_url',
+	'noindex'       => 'rank_math_robots',
+);
+
+/** Vilket SEO-tillägg fälten skrivs till: Yoast om det är aktivt, annars Rank Math om det är aktivt, annars Yoasts nycklar. */
+function comdeva_seo_plugin() {
+	if ( defined( 'WPSEO_VERSION' ) ) {
+		return 'yoast';
+	}
+	if ( defined( 'RANK_MATH_VERSION' ) || class_exists( 'RankMath' ) ) {
+		return 'rankmath';
+	}
+	return 'yoast';
+}
+
+function comdeva_seo_fields() {
+	return 'rankmath' === comdeva_seo_plugin() ? COMDEVA_RANKMATH_FIELDS : COMDEVA_SEO_FIELDS;
+}
+
+/** Rank Maths robotslista med noindex satt eller borttaget; tom lista = tilläggets standard. */
+function comdeva_rankmath_robots( $robots, $noindex ) {
+	$robots = array_values( array_diff( is_array( $robots ) ? $robots : array(), array( 'index', 'noindex' ) ) );
+	if ( $noindex ) {
+		array_unshift( $robots, 'noindex' );
+	} elseif ( $robots ) {
+		array_unshift( $robots, 'index' );
+	}
+	return $robots;
+}
+
 add_action( 'rest_api_init', function () {
 	$can_edit = function ( WP_REST_Request $req ) {
 		$id = (int) $req['id'];
@@ -197,6 +236,8 @@ add_action( 'rest_api_init', function () {
 				'bridge'    => COMDEVA_BRIDGE_VERSION,
 				'wordpress' => get_bloginfo( 'version' ),
 				'yoast'     => defined( 'WPSEO_VERSION' ) ? WPSEO_VERSION : null,
+				'rankmath'  => defined( 'RANK_MATH_VERSION' ) ? RANK_MATH_VERSION : null,
+				'seo'       => comdeva_seo_plugin(),
 				'elementor' => defined( 'ELEMENTOR_VERSION' ) ? ELEMENTOR_VERSION : null,
 				'divi'      => comdeva_divi_version(),
 				'betheme'   => comdeva_betheme_version(),
@@ -220,11 +261,21 @@ add_action( 'rest_api_init', function () {
 			'callback'            => function ( WP_REST_Request $req ) {
 				$id     = (int) $req['id'];
 				$params = $req->get_json_params();
-				foreach ( COMDEVA_SEO_FIELDS as $field => $meta_key ) {
+				$rank   = 'rankmath' === comdeva_seo_plugin();
+				foreach ( comdeva_seo_fields() as $field => $meta_key ) {
 					if ( ! is_array( $params ) || ! array_key_exists( $field, $params ) ) {
 						continue;
 					}
 					$value = $params[ $field ];
+					if ( 'noindex' === $field && $rank ) {
+						$robots = comdeva_rankmath_robots( get_post_meta( $id, $meta_key, true ), (bool) $value );
+						if ( $robots ) {
+							update_post_meta( $id, $meta_key, $robots );
+						} else {
+							delete_post_meta( $id, $meta_key );
+						}
+						continue;
+					}
 					if ( 'noindex' === $field ) {
 						$value = $value ? '1' : '';
 					} elseif ( 'canonical' === $field ) {
@@ -511,13 +562,89 @@ add_action( 'rest_api_init', function () {
 } );
 
 function comdeva_seo_get( $id ) {
-	$out = array( 'id' => $id );
-	foreach ( COMDEVA_SEO_FIELDS as $field => $meta_key ) {
-		$value         = get_post_meta( $id, $meta_key, true );
-		$out[ $field ] = 'noindex' === $field ? '1' === (string) $value : (string) $value;
+	$plugin = comdeva_seo_plugin();
+	$out    = array( 'id' => $id, 'plugin' => $plugin );
+	foreach ( comdeva_seo_fields() as $field => $meta_key ) {
+		$value = get_post_meta( $id, $meta_key, true );
+		if ( 'noindex' === $field ) {
+			$out[ $field ] = 'rankmath' === $plugin
+				? is_array( $value ) && in_array( 'noindex', $value, true )
+				: '1' === (string) $value;
+		} else {
+			$out[ $field ] = (string) $value;
+		}
 	}
 	return $out;
 }
+
+/*
+ * Search Console-verifiering (1.18): HTML-taggens kod i SEO-tilläggets inställning.
+ *   GET  /comdeva/v1/site-verification            {plugin, google}
+ *   POST /comdeva/v1/site-verification {google}   hela meta-taggen eller bara koden; "" tar bort den
+ */
+function comdeva_verification_code( $value ) {
+	$value = trim( (string) $value );
+	if ( preg_match( '/content\s*=\s*["\']([^"\']*)["\']/i', $value, $m ) ) {
+		$value = trim( $m[1] );
+	}
+	if ( '' !== $value && ! preg_match( '/^[A-Za-z0-9_\-]{10,100}$/', $value ) ) {
+		return new WP_Error( 'comdeva_bad_verification', 'Koden ska vara värdet i content="…" från Search Console', array( 'status' => 400 ) );
+	}
+	return $value;
+}
+
+function comdeva_verification_get() {
+	$plugin = comdeva_seo_plugin();
+	if ( 'rankmath' === $plugin ) {
+		$opts = get_option( 'rank-math-options-general', array() );
+		$code = is_array( $opts ) ? ( $opts['google_verify'] ?? '' ) : '';
+	} else {
+		$opts = get_option( 'wpseo', array() );
+		$code = is_array( $opts ) ? ( $opts['googleverify'] ?? '' ) : '';
+	}
+	return array( 'plugin' => $plugin, 'google' => (string) $code );
+}
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'comdeva/v1', '/site-verification', array(
+		array(
+			'methods'             => 'GET',
+			'permission_callback' => function () {
+				return current_user_can( 'manage_options' );
+			},
+			'callback'            => 'comdeva_verification_get',
+		),
+		array(
+			'methods'             => 'POST',
+			'permission_callback' => function () {
+				return current_user_can( 'manage_options' );
+			},
+			'callback'            => function ( WP_REST_Request $req ) {
+				$params = $req->get_json_params();
+				if ( ! is_array( $params ) || ! array_key_exists( 'google', $params ) ) {
+					return new WP_Error( 'comdeva_bad_verification', 'google saknas', array( 'status' => 400 ) );
+				}
+				$code = comdeva_verification_code( $params['google'] );
+				if ( is_wp_error( $code ) ) {
+					return $code;
+				}
+				if ( 'rankmath' === comdeva_seo_plugin() ) {
+					$key  = 'rank-math-options-general';
+					$opts = get_option( $key, array() );
+					$opts = is_array( $opts ) ? $opts : array();
+					$opts['google_verify'] = $code;
+				} else {
+					$key  = 'wpseo';
+					$opts = get_option( $key, array() );
+					$opts = is_array( $opts ) ? $opts : array();
+					$opts['googleverify'] = $code;
+				}
+				update_option( $key, $opts );
+				return comdeva_verification_get();
+			},
+		),
+	) );
+} );
 
 /*
  * Divi-tema och Theme Builder (1.5):
@@ -1674,10 +1801,31 @@ function comdeva_quarantine_plugin( $entry, $dry_run ) {
 			return new WP_Error( 'comdeva_quarantine_active', "Stäng av $plugin först", array( 'status' => 409 ) );
 		}
 	}
-	$batch = $entry . '-' . gmdate( 'Ymd\THis' );
+	return comdeva_quarantine_dir( $src, $entry, $entry, $dry_run );
+}
+
+// En katalog under uploads (1.20), t.ex. wp-file-manager-pro/fm_backup. Måste ligga minst en nivå ner och
+// får inte vara en års-/månadskatalog med mediebibliotekets bilder.
+function comdeva_quarantine_uploads( $rel, $dry_run ) {
+	$up   = wp_get_upload_dir();
+	$base = untrailingslashit( wp_normalize_path( $up['basedir'] ) );
+	$rel  = trim( wp_normalize_path( (string) $rel ), '/' );
+	$src  = $base . '/' . $rel;
+	if ( '' === $rel || preg_match( '#(^|/)\.#', $rel ) || ! is_dir( $src ) || is_link( $src ) ) {
+		return new WP_Error( 'comdeva_quarantine_missing', "Katalogen finns inte under uploads: $rel", array( 'status' => 404 ) );
+	}
+	if ( preg_match( '#^\d{4}(/|$)#', $rel ) ) {
+		return new WP_Error( 'comdeva_quarantine_media', 'Mediebibliotekets års-/månadskataloger flyttas inte', array( 'status' => 400 ) );
+	}
+	return comdeva_quarantine_dir( $src, 'uploads-' . str_replace( '/', '_', $rel ), 'uploads/' . $rel, $dry_run );
+}
+
+function comdeva_quarantine_dir( $src, $label, $what, $dry_run ) {
+	$entry = $what;
+	$batch = $label . '-' . gmdate( 'Ymd\THis' );
 	$dst   = comdeva_quarantine_root() . '/' . $batch;
 	$files = array();
-	foreach ( comdeva_security_walk( $src, 20000, false ) as $f ) {
+	foreach ( comdeva_quarantine_files( $src ) as $f ) {
 		$rel     = substr( $f, strlen( $src ) + 1 );
 		$files[] = array(
 			'from'   => comdeva_security_rel( $f ),
@@ -1733,6 +1881,25 @@ function comdeva_quarantine_plugin( $entry, $dry_run ) {
 	$manifest['source_removed'] = ! is_dir( $src );
 	file_put_contents( $dst . '/manifest.json.quarantine', wp_json_encode( $manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
 	return $manifest;
+}
+
+// Alla filer i katalogen, även dolda (.htaccess) – inget hoppas över.
+function comdeva_quarantine_files( $src ) {
+	$out = array();
+	try {
+		$it = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( $src, FilesystemIterator::SKIP_DOTS ) );
+		foreach ( $it as $f ) {
+			if ( $f->isFile() ) {
+				$out[] = wp_normalize_path( $f->getPathname() );
+			}
+			if ( count( $out ) >= 20000 ) {
+				break;
+			}
+		}
+	} catch ( Exception $e ) {
+		return $out;
+	}
+	return $out;
 }
 
 function comdeva_quarantine_list() {
@@ -1792,6 +1959,9 @@ add_action( 'rest_api_init', function () {
 			'methods'             => 'POST',
 			'permission_callback' => $can,
 			'callback'            => function ( WP_REST_Request $req ) {
+				if ( ! empty( $req['uploads'] ) ) {
+					return comdeva_quarantine_uploads( $req['uploads'], ! empty( $req['dry_run'] ) );
+				}
 				return comdeva_quarantine_plugin( $req['plugin'], ! empty( $req['dry_run'] ) );
 			},
 		),
@@ -1923,5 +2093,57 @@ add_action( 'rest_api_init', function () {
 			return current_user_can( 'manage_options' );
 		},
 		'callback'            => 'comdeva_theme_file_edit',
+	) );
+} );
+
+// ---------------------------------------------------------------------------------------------
+// Sidcache (1.19). När Elementor sparar töms alla Elementors CSS-filer och skrivs om först när en sida visas.
+// Hinner WP Rocket (lazyload av bakgrundsbilder i CSS) hämta kitets fil (post-<kit>.css) innan dess, får den
+// startsidan via omdirigeringen och sparar HTML som CSS – sajtens färger och typsnitt försvinner (SVEAB 2026-10-20).
+// Därför skrivs kitets CSS om först, och sedan töms sidcachen så att WP Rocket bygger om sina kopior.
+
+function comdeva_cache_backends() {
+	$found = array();
+	if ( function_exists( 'wpfc_clear_all_cache' ) ) {
+		$found[] = 'wp-fastest-cache';
+	}
+	if ( function_exists( 'rocket_clean_domain' ) ) {
+		$found[] = 'wp-rocket';
+	}
+	if ( has_action( 'litespeed_purge_all' ) ) {
+		$found[] = 'litespeed';
+	}
+	if ( function_exists( 'w3tc_flush_all' ) ) {
+		$found[] = 'w3-total-cache';
+	}
+	return $found;
+}
+
+function comdeva_cache_clear( WP_REST_Request $req ) {
+	$dry  = (bool) $req->get_param( 'dry_run' );
+	$kit  = 0;
+	if ( class_exists( '\Elementor\Plugin' ) && isset( \Elementor\Plugin::$instance->kits_manager ) ) {
+		$kit = (int) \Elementor\Plugin::$instance->kits_manager->get_active_id();
+	}
+	$out = array( 'dry_run' => $dry, 'elementor_kit' => $kit ?: null, 'kit_css' => null, 'caches' => comdeva_cache_backends() );
+	if ( $dry ) {
+		return $out;
+	}
+	if ( $kit && class_exists( '\Elementor\Core\Files\CSS\Post' ) ) {
+		$css = \Elementor\Core\Files\CSS\Post::create( $kit );
+		$css->update();
+		$out['kit_css'] = $css->get_url();
+	}
+	$out['cache_cleared'] = comdeva_clear_page_cache();
+	return $out;
+}
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'comdeva/v1', '/cache', array(
+		'methods'             => 'POST',
+		'permission_callback' => function () {
+			return current_user_can( 'manage_options' );
+		},
+		'callback'            => 'comdeva_cache_clear',
 	) );
 } );
