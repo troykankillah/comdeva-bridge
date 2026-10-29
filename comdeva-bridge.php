@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Comdeva Bridge
  * Description: Låter Comdevas verktyg läsa och ändra SEO-fält (Yoast eller Rank Math) och Elementor-/Divi-innehåll via REST, med samma behörighet som i WordPress (edit_post). Installeras som vanligt tillägg (zip) och uppdateras sedan under Tillägg som andra tillägg.
- * Version: 1.20.0
+ * Version: 1.21.0
  * Author: Comdeva
  * Requires PHP: 7.4
  * Update URI: https://github.com/troykankillah/comdeva-bridge
@@ -37,13 +37,14 @@
  *   POST /wp-json/comdeva/v1/security/quarantine/restore  {batch} – flytta tillbaka
  *   POST /wp-json/comdeva/v1/theme-file  {path, sha256, find, replace, dry_run} – byt exakt en textbit i en temafil (1.17)
  *   POST /wp-json/comdeva/v1/cache  {dry_run} – Elementors kit-CSS skrivs om, sedan töms sidcachen (WP Rocket m.fl.) (1.19)
+ *                                   {urls} – NitroPack töms bara för de sidorna, annars hela (1.21); andra töms helt
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const COMDEVA_BRIDGE_VERSION = '1.20.0';
+const COMDEVA_BRIDGE_VERSION = '1.21.0';
 
 // Uppdateringar som ett vanligt tillägg: WordPress läser update.json i det publika repot
 // troykankillah/comdeva-bridge (byggs av bridge_release.py) och visar
@@ -1982,7 +1983,7 @@ add_action( 'rest_api_init', function () {
 // sparas i wp-content/comdeva-backups/ och skickas tillbaka i svaret. Efter ändringen töms sidcachen och
 // startsidan hämtas; svarar den inte (eller med 5xx) läggs originalet tillbaka direkt.
 
-function comdeva_clear_page_cache() {
+function comdeva_clear_page_cache( $urls = array() ) {
 	$done = array();
 	if ( function_exists( 'wpfc_clear_all_cache' ) ) {
 		wpfc_clear_all_cache( true );
@@ -2000,7 +2001,42 @@ function comdeva_clear_page_cache() {
 		w3tc_flush_all();
 		$done[] = 'w3-total-cache';
 	}
+	// NitroPack (1.21, Skogshem och Haga): utan url töms hela cachen (lokalt + NitroPacks CDN), med url bara den sidan.
+	// Funktionen returnerar false om NitroPack inte är ansluten till sitt konto.
+	if ( function_exists( 'nitropack_sdk_purge' ) ) {
+		$ok = true;
+		try {
+			foreach ( $urls ? $urls : array( null ) as $url ) {
+				$ok = nitropack_sdk_purge( $url, null, 'Comdeva Bridge' ) && $ok;
+			}
+		} catch ( \Throwable $e ) {
+			$ok = false;
+		}
+		$n      = count( $urls );
+		$done[] = ! $ok ? 'nitropack misslyckades (inte ansluten?)'
+			: ( $n ? 'nitropack (' . $n . ( 1 === $n ? ' sida)' : ' sidor)' ) : 'nitropack' );
+	}
 	return $done;
+}
+
+// Sidor att tömma i NitroPack: sökvägar (/erbjudanden/) eller hela adresser på sajten. Andra domäner stoppas.
+function comdeva_cache_urls( $urls ) {
+	$host = strtolower( (string) wp_parse_url( home_url( '/' ), PHP_URL_HOST ) );
+	$out  = array();
+	foreach ( (array) $urls as $url ) {
+		$url = trim( (string) $url );
+		if ( '' === $url ) {
+			continue;
+		}
+		if ( ! preg_match( '#^https?://#i', $url ) ) {
+			$url = home_url( '/' . ltrim( $url, '/' ) );
+		}
+		if ( strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) ) !== $host ) {
+			return new WP_Error( 'comdeva_cache_url', 'Adressen hör inte till sajten: ' . $url, array( 'status' => 400 ) );
+		}
+		$out[] = $url;
+	}
+	return array_values( array_unique( $out ) );
 }
 
 function comdeva_theme_file_path( $rel ) {
@@ -2116,16 +2152,24 @@ function comdeva_cache_backends() {
 	if ( function_exists( 'w3tc_flush_all' ) ) {
 		$found[] = 'w3-total-cache';
 	}
+	if ( function_exists( 'nitropack_sdk_purge' ) ) {
+		$found[] = 'nitropack';
+	}
 	return $found;
 }
 
 function comdeva_cache_clear( WP_REST_Request $req ) {
 	$dry  = (bool) $req->get_param( 'dry_run' );
+	$urls = comdeva_cache_urls( $req->get_param( 'urls' ) );
+	if ( is_wp_error( $urls ) ) {
+		return $urls;
+	}
 	$kit  = 0;
 	if ( class_exists( '\Elementor\Plugin' ) && isset( \Elementor\Plugin::$instance->kits_manager ) ) {
 		$kit = (int) \Elementor\Plugin::$instance->kits_manager->get_active_id();
 	}
-	$out = array( 'dry_run' => $dry, 'elementor_kit' => $kit ?: null, 'kit_css' => null, 'caches' => comdeva_cache_backends() );
+	$out = array( 'dry_run' => $dry, 'elementor_kit' => $kit ?: null, 'kit_css' => null, 'caches' => comdeva_cache_backends(),
+		'urls' => $urls );
 	if ( $dry ) {
 		return $out;
 	}
@@ -2134,7 +2178,7 @@ function comdeva_cache_clear( WP_REST_Request $req ) {
 		$css->update();
 		$out['kit_css'] = $css->get_url();
 	}
-	$out['cache_cleared'] = comdeva_clear_page_cache();
+	$out['cache_cleared'] = comdeva_clear_page_cache( $urls );
 	return $out;
 }
 
